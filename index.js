@@ -208,4 +208,119 @@ app.get("/sessions/:tenant/chats", async (req, res, next) => {
       items = items.filter(
         (c) =>
           c.name?.toLowerCase().includes(q) ||
-          c.id?.toLowerCase().includes(q
+          c.id?.toLowerCase().includes(q) ||
+          c.lastMessage?.body?.toLowerCase().includes(q)
+      );
+    }
+
+    const slice = items.slice(offset, offset + limit);
+    res.json({
+      total: items.length,
+      offset,
+      limit,
+      items: slice,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 2.2 Listar mensagens de um chat
+// GET /sessions/:tenant/chats/:chatId/messages?limit=50
+app.get("/sessions/:tenant/chats/:chatId/messages", async (req, res, next) => {
+  try {
+    const { tenant, chatId } = req.params;
+    const limit = Math.max(1, Math.min(Number(req.query.limit) || 50, 200));
+
+    const { client } = requireOnline(tenant);
+    const chat = await client.getChatById(chatId);
+    const messages = await chat.fetchMessages({ limit });
+
+    res.json(messages.map(toMessageDTO));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 2.3 Enviar texto
+// POST /sessions/:tenant/messages
+// body: { to: "5511999999999@c.us" (ou "5511999999999"), body: "Olá" , quotedMsgId? }
+app.post("/sessions/:tenant/messages", async (req, res, next) => {
+  try {
+    const { tenant } = req.params;
+    let { to, body, quotedMsgId } = req.body || {};
+    if (!to || !body) return res.status(400).json({ ok: false, error: "to e body são obrigatórios" });
+
+    // normaliza número
+    if (!to.includes("@")) to = `${to}@c.us`;
+
+    const { client } = requireOnline(tenant);
+    const options = quotedMsgId ? { quotedMessageId: quotedMsgId } : {};
+    const msg = await client.sendMessage(to, body, options);
+    res.json({ ok: true, messageId: msg.id?._serialized ?? msg.id });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 2.4 Enviar mídia por URL ou base64
+// POST /sessions/:tenant/messages/media
+// body:
+//   { to, mediaUrl, caption?, filename?, mimetype? }
+//   ou { to, base64, caption?, filename, mimetype }
+app.post("/sessions/:tenant/messages/media", async (req, res, next) => {
+  try {
+    const { tenant } = req.params;
+    let { to, mediaUrl, base64, caption, filename, mimetype } = req.body || {};
+    if (!to) return res.status(400).json({ ok: false, error: "to é obrigatório" });
+    if (!mediaUrl && !base64) return res.status(400).json({ ok: false, error: "informe mediaUrl ou base64" });
+
+    if (!to.includes("@")) to = `${to}@c.us`;
+
+    let media;
+    if (mediaUrl) {
+      // usa fetch nativo do Node 20+
+      const resp = await fetch(mediaUrl);
+      if (!resp.ok) throw new Error(`Falha ao baixar mídia: HTTP ${resp.status}`);
+      const buf = Buffer.from(await resp.arrayBuffer());
+      const b64 = buf.toString("base64");
+      const ct = mimetype || resp.headers.get("content-type") || "application/octet-stream";
+      const name = filename || mediaUrl.split("/").pop()?.split("?")[0] || "file";
+      media = new MessageMedia(ct, b64, name);
+    } else {
+      // base64 fornecido pelo cliente
+      if (!mimetype || !filename) return res.status(400).json({ ok: false, error: "informe mimetype e filename junto ao base64" });
+      media = new MessageMedia(mimetype, base64, filename);
+    }
+
+    const { client } = requireOnline(tenant);
+    const msg = await client.sendMessage(to, media, { caption });
+    res.json({ ok: true, messageId: msg.id?._serialized ?? msg.id });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 2.5 Marcar como lido
+// POST /sessions/:tenant/chats/:chatId/read
+app.post("/sessions/:tenant/chats/:chatId/read", async (req, res, next) => {
+  try {
+    const { tenant, chatId } = req.params;
+    const { client } = requireOnline(tenant);
+    const chat = await client.getChatById(chatId);
+    await chat.sendSeen();
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===== HOME & ERROS =====
+app.get("/", (_req, res) => res.send("WA QR Connector up ✅"));
+
+app.use((err, _req, res, _next) => {
+  const code = err.status || 500;
+  res.status(code).json({ ok: false, error: err.message || "Erro interno" });
+});
+
+app.listen(PORT, () => console.log("Listening on", PORT));
