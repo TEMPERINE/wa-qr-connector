@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
-import { Client, LocalAuth } from "whatsapp-web.js";
+import pkg from "whatsapp-web.js";
+const { Client, LocalAuth } = pkg;
 
 const app = express();
 app.use(cors());
