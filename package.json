@@ -1,0 +1,12 @@
+{
+  "name": "wa-qr-connector",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "qrcode": "^1.5.3",
+    "whatsapp-web.js": "^1.23.0"
+  }
+}
