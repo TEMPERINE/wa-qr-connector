@@ -1,11 +1,6 @@
 // ===== WhatsApp QR Connector - Atendimento (multi-tenant) =====
-// Funciona com whatsapp-web.js + Express e expõe endpoints para:
-// - Conexão via QR (já existia)
-// - Listar chats
-// - Listar mensagens de um chat
-// - Enviar texto e mídia
-// - Marcar chat como lido
-// - Stream SSE com mensagens novas / acks / status
+// Endpoints: conexão via QR, listar chats, listar mensagens, enviar texto/mídia,
+// marcar como lido, SSE de eventos e ***status da sessão***.
 
 import express from "express";
 import cors from "cors";
@@ -14,11 +9,10 @@ const { Client, LocalAuth, MessageMedia } = pkg;
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: "15mb" })); // para receber JSON/base64 de mídia
+app.use(express.json({ limit: "15mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-// Memória simples em runtime
 // tenant -> { client, status, listeners:Set<res>, qr }
 const sessions = new Map();
 
@@ -57,15 +51,15 @@ function toMessageDTO(msg) {
     to: msg.to,
     fromMe: !!msg.fromMe,
     body: msg.body,
-    type: msg.type, // chat, image, audio, ptt, document, etc.
+    type: msg.type,
     hasMedia: !!msg.hasMedia,
     mimetype: msg.mimetype ?? null,
     filename: msg.filename ?? null,
     size: msg.size ?? null,
-    ack: msg.ack ?? null, // 0 pendente, 1 enviada, 2 entregue, 3 lida, 4 reproduzida (áudio)
+    ack: msg.ack ?? null,
     timestamp: msg.timestamp ?? null,
     quotedMsgId: msg.hasQuotedMsg ? msg._data?.quotedMsgId ?? null : null,
-    author: msg.author ?? null, // útil para grupos
+    author: msg.author ?? null,
   };
 }
 
@@ -89,7 +83,6 @@ function getOrCreateSession(tenant) {
     broadcast(tenant, { type: "status", status: st });
   };
 
-  // --- Eventos de conexão / QR ---
   client.on("qr", (qr) => {
     s.qr = qr;
     setStatus("RECONNECTING");
@@ -105,27 +98,18 @@ function getOrCreateSession(tenant) {
 
   client.on("disconnected", async () => {
     setStatus("RECONNECTING");
-    try {
-      await client.initialize();
-    } catch {
-      setStatus("OFFLINE");
-    }
+    try { await client.initialize(); } catch { setStatus("OFFLINE"); }
   });
 
   client.on("auth_failure", () => setStatus("OFFLINE"));
 
-  // --- Eventos de atendimento (tempo real) ---
-  client.on("message", (msg) => {
-    broadcast(tenant, { type: "message", message: toMessageDTO(msg) });
-  });
-
+  client.on("message", (msg) => broadcast(tenant, { type: "message", message: toMessageDTO(msg) }));
   client.on("message_ack", (msg, ack) => {
     const id = msg?.id?._serialized ?? msg?.id;
     broadcast(tenant, { type: "ack", messageId: id, ack });
   });
 
   client.initialize().catch(() => setStatus("OFFLINE"));
-
   return s;
 }
 
@@ -139,7 +123,7 @@ function requireOnline(tenant) {
   return s;
 }
 
-// ===== ROTAS JÁ EXISTENTES (conexão) =====
+// ===== Conexão =====
 app.post("/sessions/:tenant/start", (req, res) => {
   const { tenant } = req.params;
   const s = getOrCreateSession(tenant);
@@ -150,45 +134,40 @@ app.get("/sessions/:tenant/stream", (req, res) => {
   const { tenant } = req.params;
   const s = getOrCreateSession(tenant);
 
-  res.set({
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache",
-    Connection: "keep-alive",
-  });
+  res.set({ "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" });
   res.flushHeaders?.();
 
   s.listeners.add(res);
-  // Estado inicial
   res.write(`data: ${JSON.stringify({ type: "status", status: s.status })}\n\n`);
   if (s.qr) res.write(`data: ${JSON.stringify({ type: "qr", qr: s.qr })}\n\n`);
-
   req.on("close", () => s.listeners.delete(res));
 });
 
 app.post("/sessions/:tenant/stop", async (req, res) => {
   const { tenant } = req.params;
   const s = sessions.get(tenant);
-  if (s) {
-    try {
-      await s.client.destroy();
-    } catch {}
-    sessions.delete(tenant);
-  }
+  if (s) { try { await s.client.destroy(); } catch {} sessions.delete(tenant); }
   return res.json({ ok: true, tenant });
 });
 
 app.get("/sessions", (_req, res) => {
-  const list = [...sessions.entries()].map(([tenant, s]) => ({
-    tenant,
-    status: s.status,
-  }));
+  const list = [...sessions.entries()].map(([tenant, s]) => ({ tenant, status: s.status }));
   res.json(list);
 });
 
-// ===== NOVAS ROTAS — ATENDIMENTO =====
+// *** NOVA ROTA: Status da sessão ***
+// GET /sessions/:tenant/status
+app.get("/sessions/:tenant/status", (req, res) => {
+  const { tenant } = req.params;
+  const s = sessions.get(tenant);
+  if (!s) return res.status(404).json({ ok: false, error: "Sessão não encontrada" });
+  // Se tiver client pronto => ONLINE; se existe mas ainda inicializando => RECONNECTING/INITIALIZING; senão OFFLINE.
+  const state = s.status || (s.client?.info ? "ONLINE" : "INITIALIZING");
+  return res.json({ ok: true, tenant, status: state });
+});
 
-// 2.1 Listar chats
-// GET /sessions/:tenant/chats?q=termo&limit=30&offset=0
+// ===== Atendimento =====
+// Listar chats
 app.get("/sessions/:tenant/chats", async (req, res, next) => {
   try {
     const { tenant } = req.params;
@@ -214,72 +193,47 @@ app.get("/sessions/:tenant/chats", async (req, res, next) => {
     }
 
     const slice = items.slice(offset, offset + limit);
-    res.json({
-      total: items.length,
-      offset,
-      limit,
-      items: slice,
-    });
-  } catch (err) {
-    next(err);
-  }
+    res.json({ total: items.length, offset, limit, items: slice });
+  } catch (err) { next(err); }
 });
 
-// 2.2 Listar mensagens de um chat
-// GET /sessions/:tenant/chats/:chatId/messages?limit=50
+// Listar mensagens
 app.get("/sessions/:tenant/chats/:chatId/messages", async (req, res, next) => {
   try {
     const { tenant, chatId } = req.params;
     const limit = Math.max(1, Math.min(Number(req.query.limit) || 50, 200));
-
     const { client } = requireOnline(tenant);
     const chat = await client.getChatById(chatId);
     const messages = await chat.fetchMessages({ limit });
-
     res.json(messages.map(toMessageDTO));
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 });
 
-// 2.3 Enviar texto
-// POST /sessions/:tenant/messages
-// body: { to: "5511999999999@c.us" (ou "5511999999999"), body: "Olá" , quotedMsgId? }
+// Enviar texto
 app.post("/sessions/:tenant/messages", async (req, res, next) => {
   try {
     const { tenant } = req.params;
     let { to, body, quotedMsgId } = req.body || {};
     if (!to || !body) return res.status(400).json({ ok: false, error: "to e body são obrigatórios" });
-
-    // normaliza número
     if (!to.includes("@")) to = `${to}@c.us`;
-
     const { client } = requireOnline(tenant);
     const options = quotedMsgId ? { quotedMessageId: quotedMsgId } : {};
     const msg = await client.sendMessage(to, body, options);
     res.json({ ok: true, messageId: msg.id?._serialized ?? msg.id });
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 });
 
-// 2.4 Enviar mídia por URL ou base64
-// POST /sessions/:tenant/messages/media
-// body:
-//   { to, mediaUrl, caption?, filename?, mimetype? }
-//   ou { to, base64, caption?, filename, mimetype }
+// Enviar mídia (URL ou base64)
 app.post("/sessions/:tenant/messages/media", async (req, res, next) => {
   try {
     const { tenant } = req.params;
     let { to, mediaUrl, base64, caption, filename, mimetype } = req.body || {};
     if (!to) return res.status(400).json({ ok: false, error: "to é obrigatório" });
     if (!mediaUrl && !base64) return res.status(400).json({ ok: false, error: "informe mediaUrl ou base64" });
-
     if (!to.includes("@")) to = `${to}@c.us`;
 
     let media;
     if (mediaUrl) {
-      // usa fetch nativo do Node 20+
       const resp = await fetch(mediaUrl);
       if (!resp.ok) throw new Error(`Falha ao baixar mídia: HTTP ${resp.status}`);
       const buf = Buffer.from(await resp.arrayBuffer());
@@ -288,7 +242,6 @@ app.post("/sessions/:tenant/messages/media", async (req, res, next) => {
       const name = filename || mediaUrl.split("/").pop()?.split("?")[0] || "file";
       media = new MessageMedia(ct, b64, name);
     } else {
-      // base64 fornecido pelo cliente
       if (!mimetype || !filename) return res.status(400).json({ ok: false, error: "informe mimetype e filename junto ao base64" });
       media = new MessageMedia(mimetype, base64, filename);
     }
@@ -296,13 +249,10 @@ app.post("/sessions/:tenant/messages/media", async (req, res, next) => {
     const { client } = requireOnline(tenant);
     const msg = await client.sendMessage(to, media, { caption });
     res.json({ ok: true, messageId: msg.id?._serialized ?? msg.id });
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 });
 
-// 2.5 Marcar como lido
-// POST /sessions/:tenant/chats/:chatId/read
+// Marcar como lido
 app.post("/sessions/:tenant/chats/:chatId/read", async (req, res, next) => {
   try {
     const { tenant, chatId } = req.params;
@@ -310,12 +260,10 @@ app.post("/sessions/:tenant/chats/:chatId/read", async (req, res, next) => {
     const chat = await client.getChatById(chatId);
     await chat.sendSeen();
     res.json({ ok: true });
-  } catch (err) {
-    next(err);
-  }
+  } catch (err) { next(err); }
 });
 
-// ===== HOME & ERROS =====
+// Home & erros
 app.get("/", (_req, res) => res.send("WA QR Connector up ✅"));
 
 app.use((err, _req, res, _next) => {
