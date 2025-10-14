@@ -61,15 +61,15 @@ function toMessageDTO(msg) {
     to: msg.to,
     fromMe: !!msg.fromMe,
     body: msg.body,
-    type: msg.type, // chat, image, audio, ptt, document, etc.
+    type: msg.type,
     hasMedia: !!msg.hasMedia,
     mimetype: msg.mimetype ?? null,
     filename: msg.filename ?? null,
     size: msg.size ?? null,
-    ack: msg.ack ?? null, // 0 pendente, 1 enviada, 2 entregue, 3 lida, 4 reproduzida
+    ack: msg.ack ?? null,
     timestamp: msg.timestamp ?? null,
     quotedMsgId: msg.hasQuotedMsg ? msg._data?.quotedMsgId ?? null : null,
-    author: msg.author ?? null, // útil em grupos
+    author: msg.author ?? null,
   };
 }
 
@@ -93,7 +93,6 @@ function getOrCreateSession(tenant) {
     broadcast(tenant, { type: "status", status: st });
   };
 
-  // --- conexão / QR ---
   client.on("qr", (qr) => {
     s.qr = qr;
     setStatus("RECONNECTING");
@@ -105,7 +104,9 @@ function getOrCreateSession(tenant) {
     broadcast(tenant, { type: "ready", ok: true });
   });
 
-  client.on("change_state", (state) => broadcast(tenant, { type: "state", state }));
+  client.on("change_state", (state) =>
+    broadcast(tenant, { type: "state", state })
+  );
 
   client.on("disconnected", async () => {
     setStatus("RECONNECTING");
@@ -118,7 +119,6 @@ function getOrCreateSession(tenant) {
 
   client.on("auth_failure", () => setStatus("OFFLINE"));
 
-  // --- eventos em tempo real ---
   client.on("message", (msg) => {
     broadcast(tenant, { type: "message", message: toMessageDTO(msg) });
   });
@@ -188,15 +188,14 @@ app.get("/sessions", (_req, res) => {
   res.json(list);
 });
 
-// Status simples via HTTP por tenant (já existia)
 app.get("/sessions/:tenant/status", (req, res) => {
   const { tenant } = req.params;
   const s = sessions.get(tenant);
-  if (!s) return res.status(404).json({ ok: false, error: "Sessão não encontrada" });
+  if (!s)
+    return res.status(404).json({ ok: false, error: "Sessão não encontrada" });
   return res.json({ ok: true, tenant, status: s.status });
 });
 
-// ✅ NOVA ROTA: status GLOBAL (para health-check do Lovable)
 app.get("/sessions/status", (_req, res) => {
   const list = [...sessions.entries()].map(([tenant, s]) => ({
     tenant,
@@ -208,187 +207,6 @@ app.get("/sessions/status", (_req, res) => {
     uptime: process.uptime(),
     sessions: list,
   });
-});
-
-/* --------------------------- rotas atendimento --------------------------- */
-
-// 1) Listar chats com filtros/paginação
-// GET /sessions/:tenant/chats?q=&isGroup=true|false&archived=true|false&unreadOnly=true|false&limit=30&offset=0
-app.get("/sessions/:tenant/chats", async (req, res, next) => {
-  try {
-    const { tenant } = req.params;
-    const q = (req.query.q || "").toString().toLowerCase();
-    const limit = Math.max(1, Math.min(Number(req.query.limit) || 30, 200));
-    const offset = Math.max(0, Number(req.query.offset) || 0);
-
-    const isGroup =
-      req.query.isGroup === "true" ? true : req.query.isGroup === "false" ? false : null;
-    const archived =
-      req.query.archived === "true" ? true : req.query.archived === "false" ? false : null;
-    const unreadOnly = req.query.unreadOnly === "true";
-
-    const { client } = requireOnline(tenant);
-    const chats = await client.getChats();
-
-    let items = chats
-      .filter((c) => !c.isAnnouncement)
-      .map(toChatDTO);
-
-    if (isGroup !== null) items = items.filter((c) => c.isGroup === isGroup);
-    if (archived !== null) items = items.filter((c) => c.archived === archived);
-    if (unreadOnly) items = items.filter((c) => (c.unreadCount ?? 0) > 0);
-
-    if (q) {
-      items = items.filter(
-        (c) =>
-          c.name?.toLowerCase().includes(q) ||
-          c.id?.toLowerCase().includes(q) ||
-          c.lastMessage?.body?.toLowerCase().includes(q)
-      );
-    }
-
-    items.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
-
-    const slice = items.slice(offset, offset + limit);
-    res.json({ total: items.length, offset, limit, items: slice });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// 2) Foto do chat/contato
-// GET /sessions/:tenant/chats/:chatId/photo
-app.get("/sessions/:tenant/chats/:chatId/photo", async (req, res, next) => {
-  try {
-    const { tenant, chatId } = req.params;
-    const { client } = requireOnline(tenant);
-
-    const chat = await client.getChatById(chatId);
-    let url = null;
-
-    if (typeof chat.getProfilePicUrl === "function") {
-      url = await chat.getProfilePicUrl();
-    }
-    if (!url && typeof chat.getContact === "function") {
-      const contact = await chat.getContact();
-      if (contact && typeof contact.getProfilePicUrl === "function") {
-        url = await contact.getProfilePicUrl();
-      }
-    }
-
-    res.json({ ok: true, chatId, url });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// 3) Listar mensagens de um chat (histórico)
-// GET /sessions/:tenant/chats/:chatId/messages?limit=50
-app.get("/sessions/:tenant/chats/:chatId/messages", async (req, res, next) => {
-  try {
-    const { tenant, chatId } = req.params;
-    const limit = Math.max(1, Math.min(Number(req.query.limit) || 50, 200));
-
-    const { client } = requireOnline(tenant);
-    const chat = await client.getChatById(chatId);
-    const messages = await chat.fetchMessages({ limit });
-
-    res.json(messages.map(toMessageDTO));
-  } catch (err) {
-    next(err);
-  }
-});
-
-// 4) Baixar mídia de uma mensagem
-// GET /sessions/:tenant/messages/:messageId/media
-app.get("/sessions/:tenant/messages/:messageId/media", async (req, res, next) => {
-  try {
-    const { tenant, messageId } = req.params;
-    const { client } = requireOnline(tenant);
-
-    const msg = await client.getMessageById(messageId);
-    if (!msg || !msg.hasMedia) {
-      return res.status(404).json({ ok: false, error: "Mídia não encontrada para essa mensagem" });
-    }
-
-    const media = await msg.downloadMedia();
-    res.json({
-      ok: true,
-      messageId,
-      mimetype: media.mimetype,
-      filename: media.filename || "file",
-      data: media.data, // base64
-    });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// 5) Enviar texto
-// POST /sessions/:tenant/messages  { to, body, quotedMsgId? }
-app.post("/sessions/:tenant/messages", async (req, res, next) => {
-  try {
-    const { tenant } = req.params;
-    let { to, body, quotedMsgId } = req.body || {};
-    if (!to || !body) return res.status(400).json({ ok: false, error: "to e body são obrigatórios" });
-
-    if (!to.includes("@")) to = `${to}@c.us`;
-
-    const { client } = requireOnline(tenant);
-    const options = quotedMsgId ? { quotedMessageId: quotedMsgId } : {};
-    const msg = await client.sendMessage(to, body, options);
-    res.json({ ok: true, messageId: msg.id?._serialized ?? msg.id });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// 6) Enviar mídia (URL ou base64)
-// POST /sessions/:tenant/messages/media
-app.post("/sessions/:tenant/messages/media", async (req, res, next) => {
-  try {
-    const { tenant } = req.params;
-    let { to, mediaUrl, base64, caption, filename, mimetype } = req.body || {};
-    if (!to) return res.status(400).json({ ok: false, error: "to é obrigatório" });
-    if (!mediaUrl && !base64) return res.status(400).json({ ok: false, error: "informe mediaUrl ou base64" });
-
-    if (!to.includes("@")) to = `${to}@c.us`;
-
-    let media;
-    if (mediaUrl) {
-      const resp = await fetch(mediaUrl);
-      if (!resp.ok) throw new Error(`Falha ao baixar mídia: HTTP ${resp.status}`);
-      const buf = Buffer.from(await resp.arrayBuffer());
-      const b64 = buf.toString("base64");
-      const ct = mimetype || resp.headers.get("content-type") || "application/octet-stream";
-      const name = filename || mediaUrl.split("/").pop()?.split("?")[0] || "file";
-      media = new MessageMedia(ct, b64, name);
-    } else {
-      if (!mimetype || !filename)
-        return res.status(400).json({ ok: false, error: "informe mimetype e filename junto ao base64" });
-      media = new MessageMedia(mimetype, base64, filename);
-    }
-
-    const { client } = requireOnline(tenant);
-    const msg = await client.sendMessage(to, media, { caption });
-    res.json({ ok: true, messageId: msg.id?._serialized ?? msg.id });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// 7) Marcar chat como lido
-// POST /sessions/:tenant/chats/:chatId/read
-app.post("/sessions/:tenant/chats/:chatId/read", async (req, res, next) => {
-  try {
-    const { tenant, chatId } = req.params;
-    const { client } = requireOnline(tenant);
-    const chat = await client.getChatById(chatId);
-    await chat.sendSeen();
-    res.json({ ok: true });
-  } catch (err) {
-    next(err);
-  }
 });
 
 /* --------------------------- home & erros --------------------------- */
