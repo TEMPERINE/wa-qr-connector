@@ -5,11 +5,14 @@
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": "18.x"
+  },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
+    "puppeteer": "^22.10.0",
     "qrcode": "^1.5.3",
-    "whatsapp-web.js": "^1.23.0",
-    "puppeteer": "^22.10.0"
+    "whatsapp-web.js": "^1.23.0"
   }
 }
