@@ -188,12 +188,26 @@ app.get("/sessions", (_req, res) => {
   res.json(list);
 });
 
-// Status simples via HTTP (para a UI checar sem SSE)
+// Status simples via HTTP por tenant (já existia)
 app.get("/sessions/:tenant/status", (req, res) => {
   const { tenant } = req.params;
   const s = sessions.get(tenant);
   if (!s) return res.status(404).json({ ok: false, error: "Sessão não encontrada" });
   return res.json({ ok: true, tenant, status: s.status });
+});
+
+// ✅ NOVA ROTA: status GLOBAL (para health-check do Lovable)
+app.get("/sessions/status", (_req, res) => {
+  const list = [...sessions.entries()].map(([tenant, s]) => ({
+    tenant,
+    status: s.status,
+  }));
+  res.json({
+    ok: true,
+    status: "online",
+    uptime: process.uptime(),
+    sessions: list,
+  });
 });
 
 /* --------------------------- rotas atendimento --------------------------- */
@@ -207,15 +221,17 @@ app.get("/sessions/:tenant/chats", async (req, res, next) => {
     const limit = Math.max(1, Math.min(Number(req.query.limit) || 30, 200));
     const offset = Math.max(0, Number(req.query.offset) || 0);
 
-    const isGroup = req.query.isGroup === "true" ? true : req.query.isGroup === "false" ? false : null;
-    const archived = req.query.archived === "true" ? true : req.query.archived === "false" ? false : null;
+    const isGroup =
+      req.query.isGroup === "true" ? true : req.query.isGroup === "false" ? false : null;
+    const archived =
+      req.query.archived === "true" ? true : req.query.archived === "false" ? false : null;
     const unreadOnly = req.query.unreadOnly === "true";
 
     const { client } = requireOnline(tenant);
     const chats = await client.getChats();
 
     let items = chats
-      .filter((c) => !c.isAnnouncement) // evita canais
+      .filter((c) => !c.isAnnouncement)
       .map(toChatDTO);
 
     if (isGroup !== null) items = items.filter((c) => c.isGroup === isGroup);
@@ -231,7 +247,6 @@ app.get("/sessions/:tenant/chats", async (req, res, next) => {
       );
     }
 
-    // ordena por atividade recente
     items.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
 
     const slice = items.slice(offset, offset + limit);
@@ -251,7 +266,6 @@ app.get("/sessions/:tenant/chats/:chatId/photo", async (req, res, next) => {
     const chat = await client.getChatById(chatId);
     let url = null;
 
-    // alguns tipos expõem getProfilePicUrl no chat; em outros, via contact
     if (typeof chat.getProfilePicUrl === "function") {
       url = await chat.getProfilePicUrl();
     }
@@ -262,13 +276,13 @@ app.get("/sessions/:tenant/chats/:chatId/photo", async (req, res, next) => {
       }
     }
 
-    res.json({ ok: true, chatId, url }); // se null, não há foto definida
+    res.json({ ok: true, chatId, url });
   } catch (err) {
     next(err);
   }
 });
 
-// 3) Listar mensagens de um chat (historico)
+// 3) Listar mensagens de um chat (histórico)
 // GET /sessions/:tenant/chats/:chatId/messages?limit=50
 app.get("/sessions/:tenant/chats/:chatId/messages", async (req, res, next) => {
   try {
@@ -297,8 +311,7 @@ app.get("/sessions/:tenant/messages/:messageId/media", async (req, res, next) =>
       return res.status(404).json({ ok: false, error: "Mídia não encontrada para essa mensagem" });
     }
 
-    const media = await msg.downloadMedia(); // MessageMedia
-    // retorna JSON com base64; se preferir, retorne como arquivo binário
+    const media = await msg.downloadMedia();
     res.json({
       ok: true,
       messageId,
@@ -313,7 +326,6 @@ app.get("/sessions/:tenant/messages/:messageId/media", async (req, res, next) =>
 
 // 5) Enviar texto
 // POST /sessions/:tenant/messages  { to, body, quotedMsgId? }
-// "to" pode ser "5511999999999" ou "5511999999999@c.us" ou id de grupo @g.us
 app.post("/sessions/:tenant/messages", async (req, res, next) => {
   try {
     const { tenant } = req.params;
@@ -333,7 +345,6 @@ app.post("/sessions/:tenant/messages", async (req, res, next) => {
 
 // 6) Enviar mídia (URL ou base64)
 // POST /sessions/:tenant/messages/media
-// body: { to, mediaUrl, caption?, filename?, mimetype? }  OU  { to, base64, mimetype, filename, caption? }
 app.post("/sessions/:tenant/messages/media", async (req, res, next) => {
   try {
     const { tenant } = req.params;
