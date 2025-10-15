@@ -1,4 +1,4 @@
-// index.js
+// index.js (hotfix nomes de grupos)
 // ===== WhatsApp QR Connector - Multi-tenant =====
 
 import express from "express";
@@ -21,7 +21,7 @@ const shortName = (s) => {
   if (!s) return "";
   const parts = s.trim().split(/\s+/);
   if (parts.length === 1) return parts[0];
-  return `${parts[0]} ${parts[parts.length - 1]}`; // “Nome Sobrenome”
+  return `${parts[0]} ${parts[parts.length - 1]}`;
 };
 
 function normalizeType(msg) {
@@ -45,28 +45,57 @@ function normalizeType(msg) {
   }
 }
 
-async function resolveContactName(client, contactId) {
-  try {
-    const c = await client.getContactById(contactId);
-    const name = c?.name || c?.pushname || c?.shortName || c?.number || contactId;
-    return { name, short: shortName(name) };
-  } catch {
-    const num = (contactId || "").replace(/@.+$/, "");
-    return { name: num, short: num };
-  }
-}
-
+// ---------- HOTFIX: resolução robusta do nome do remetente ----------
 async function resolveMessageSenderName(client, msg) {
-  // Em grupos, msg.author contém o ID do remetente (formato 55...@c.us)
-  const senderId = msg?.author || msg?.from || null;
-  if (!senderId) return { name: null, short: null };
-  return await resolveContactName(client, senderId);
+  try {
+    // 1) Fonte mais confiável: o próprio objeto Message sabe o remetente
+    if (typeof msg.getContact === "function") {
+      try {
+        const c = await msg.getContact();
+        const name =
+          c?.name ||
+          c?.pushname ||
+          c?.verifiedName ||
+          c?.shortName ||
+          c?.number ||
+          null;
+        if (name) return { name, short: shortName(name) };
+      } catch {}
+    }
+
+    // 2) Alguns builds trazem o id do autor em grupos
+    const senderId = msg?.author || msg?.from || null;
+    if (senderId) {
+      try {
+        const c = await client.getContactById(senderId);
+        const name =
+          c?.name ||
+          c?.pushname ||
+          c?.verifiedName ||
+          c?.shortName ||
+          c?.number ||
+          senderId;
+        return { name, short: shortName(name) };
+      } catch {}
+    }
+
+    // 3) fallback: notifyName dentro do _data
+    const notifyName = msg?._data?.notifyName || msg?._data?.sender?.name || null;
+    if (notifyName) return { name: notifyName, short: shortName(notifyName) };
+
+    // 4) última defesa: número “puro”
+    const num = (senderId || msg?.from || "").replace(/@.+$/, "");
+    return { name: num || null, short: num || null };
+  } catch {
+    const num = (msg?.from || "").replace(/@.+$/, "");
+    return { name: num || null, short: num || null };
+  }
 }
 
 function broadcast(tenant, payload) {
   const s = sessions.get(tenant);
   if (!s) return;
-  for (const res of s.listeners) res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  for (const res of s.listeners) res.write(`data: ${JSON.stringify(payload)}n`);
 }
 
 /* --------------------------- DTOs --------------------------- */
@@ -82,15 +111,15 @@ async function toMessageDTO(msg, client) {
     to: msg.to,
     fromMe: !!msg.fromMe,
     body: msg.body,
-    type, // chat, image, audio, video, sticker, document...
+    type,
     hasMedia: !!msg.hasMedia,
     mimetype: msg.mimetype ?? null,
     filename: msg.filename ?? null,
     size: msg.size ?? null,
-    ack: msg.ack ?? null, // 0 pendente, 1 enviada, 2 entregue, 3 lida, 4 reproduzida
+    ack: msg.ack ?? null,
     timestamp: msg.timestamp ?? null,
     quotedMsgId: msg.hasQuotedMsg ? msg._data?.quotedMsgId ?? null : null,
-    author: msg.author ?? null, // útil em grupos
+    author: msg.author ?? null,
     senderName,
     senderShort,
     isCameraImage:
@@ -104,11 +133,12 @@ async function toChatDTO(chat, client) {
   const last = chat.lastMessage || null;
   const type = last ? normalizeType(last) : null;
 
-  // Se for grupo, resolvemos o remetente da última mensagem para exibir no preview
   let lastSenderName = null;
   if (last && chat.isGroup) {
-    const r = await resolveMessageSenderName(client, last);
-    lastSenderName = r.name;
+    try {
+      const r = await resolveMessageSenderName(client, last);
+      lastSenderName = r.name;
+    } catch {}
   }
 
   return {
@@ -132,7 +162,7 @@ async function toChatDTO(chat, client) {
           timestamp: last.timestamp ?? null,
           ack: last.ack ?? null,
           type,
-          senderName: lastSenderName, // <<<<<< importante para preview de grupo
+          senderName: lastSenderName,
           isCameraImage:
             type === "image" &&
             last?.type === "image" &&
@@ -269,7 +299,6 @@ app.get("/sessions/status", (_req, res) => {
 
 /* --------------------------- rotas de atendimento --------------------------- */
 
-// Listar chats (com preview já normalizado + lastSenderName em grupos)
 app.get("/sessions/:tenant/chats", async (req, res, next) => {
   try {
     const { tenant } = req.params;
@@ -312,7 +341,6 @@ app.get("/sessions/:tenant/chats", async (req, res, next) => {
   }
 });
 
-// Participantes de um grupo (para cache no front)
 app.get("/sessions/:tenant/chats/:chatId/participants", async (req, res, next) => {
   try {
     const { tenant, chatId } = req.params;
@@ -323,8 +351,14 @@ app.get("/sessions/:tenant/chats/:chatId/participants", async (req, res, next) =
     const result = [];
     for (const p of chat.participants || []) {
       const id = p?.id?._serialized ?? p?.id;
-      const { name, short } = await resolveContactName(client, id);
-      result.push({ id, name, short, isAdmin: !!p.isAdmin || !!p.isSuperAdmin });
+      let name = null;
+      try {
+        const c = await client.getContactById(id);
+        name = c?.name || c?.pushname || c?.verifiedName || c?.shortName || c?.number || id;
+      } catch {
+        name = (id || "").replace(/@.+$/, "");
+      }
+      result.push({ id, name, short: shortName(name), isAdmin: !!p.isAdmin || !!p.isSuperAdmin });
     }
     res.json({ ok: true, participants: result });
   } catch (err) {
@@ -332,7 +366,6 @@ app.get("/sessions/:tenant/chats/:chatId/participants", async (req, res, next) =
   }
 });
 
-// Resolver contatos em lote: /contacts?ids=id1,id2,id3
 app.get("/sessions/:tenant/contacts", async (req, res, next) => {
   try {
     const { tenant } = req.params;
@@ -344,7 +377,15 @@ app.get("/sessions/:tenant/contacts", async (req, res, next) => {
 
     const out = {};
     for (const id of ids) {
-      out[id] = await resolveContactName(client, id);
+      try {
+        const c = await client.getContactById(id);
+        const name =
+          c?.name || c?.pushname || c?.verifiedName || c?.shortName || c?.number || id;
+        out[id] = { name, short: shortName(name) };
+      } catch {
+        const num = (id || "").replace(/@.+$/, "");
+        out[id] = { name: num, short: num };
+      }
     }
     res.json({ ok: true, contacts: out });
   } catch (err) {
@@ -352,7 +393,6 @@ app.get("/sessions/:tenant/contacts", async (req, res, next) => {
   }
 });
 
-// Foto do chat/contato
 app.get("/sessions/:tenant/chats/:chatId/photo", async (req, res, next) => {
   try {
     const { tenant, chatId } = req.params;
@@ -372,7 +412,6 @@ app.get("/sessions/:tenant/chats/:chatId/photo", async (req, res, next) => {
   }
 });
 
-// Histórico
 app.get("/sessions/:tenant/chats/:chatId/messages", async (req, res, next) => {
   try {
     const { tenant, chatId } = req.params;
@@ -389,7 +428,6 @@ app.get("/sessions/:tenant/chats/:chatId/messages", async (req, res, next) => {
   }
 });
 
-// Mídia de mensagem
 app.get("/sessions/:tenant/messages/:messageId/media", async (req, res, next) => {
   try {
     const { tenant, messageId } = req.params;
@@ -414,7 +452,6 @@ app.get("/sessions/:tenant/messages/:messageId/media", async (req, res, next) =>
   }
 });
 
-// Enviar texto
 app.post("/sessions/:tenant/messages", async (req, res, next) => {
   try {
     const { tenant } = req.params;
@@ -431,7 +468,6 @@ app.post("/sessions/:tenant/messages", async (req, res, next) => {
   }
 });
 
-// Enviar mídia (url ou base64)
 app.post("/sessions/:tenant/messages/media", async (req, res, next) => {
   try {
     const { tenant } = req.params;
@@ -463,7 +499,6 @@ app.post("/sessions/:tenant/messages/media", async (req, res, next) => {
   }
 });
 
-// Marcar lido
 app.post("/sessions/:tenant/chats/:chatId/read", async (req, res, next) => {
   try {
     const { tenant, chatId } = req.params;
