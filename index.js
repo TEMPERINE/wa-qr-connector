@@ -12,7 +12,7 @@ app.use(express.json({ limit: "15mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-// tenant -> { client, status, listeners:Set<res>, qr, nameCache: Map<string,string> }
+// tenant -> { client, status, listeners:Set<res>, qr }
 const sessions = new Map();
 
 /* --------------------------- helpers --------------------------- */
@@ -25,43 +25,35 @@ function broadcast(tenant, payload) {
   }
 }
 
-/** Normaliza o melhor nome possível de um contato */
-function bestName(contact, fallbackId = null) {
-  return (
-    contact?.name ||
-    contact?.pushname ||
-    contact?.verifiedName ||
-    contact?.shortName ||
-    contact?.number ||
-    fallbackId ||
-    "Contato"
-  );
-}
-
-/** Resolve e cacheia o nome por ID (ex.: 5511999999999@c.us) */
-async function resolveName(tenant, id) {
-  if (!id) return null;
-  const s = sessions.get(tenant);
-  if (!s) return null;
-
-  // cache
-  const cached = s.nameCache.get(id);
-  if (cached) return cached;
-
+function normalizeType(msg) {
+  // Unifica detecção de mídia (inclui foto tirada pela Câmera)
   try {
-    const contact = await s.client.getContactById(id);
-    const name = bestName(contact, id);
-    s.nameCache.set(id, name);
-    return name;
+    const t = msg?.type || "";
+    const mt = msg?.mimetype || "";
+    const has = !!msg?.hasMedia;
+
+    if (t === "image") return "image";
+    if (has && mt.startsWith("image/")) return "image";
+
+    if (t === "ptt") return "audio";
+    if (t === "audio") return "audio";
+
+    if (has && mt.startsWith("audio/")) return "audio";
+    if (has && mt.startsWith("video/")) return "video";
+    if (has && (mt === "image/webp" || mt === "application/webp")) return "sticker";
+
+    return t || "chat";
   } catch {
-    // fallback apenas ao id sem cache (pode ser que ainda não exista contato)
-    return id;
+    return msg?.type || "chat";
   }
 }
 
-/** Converte um chat para DTO (sem custo alto) */
 function toChatDTO(chat) {
   const last = chat.lastMessage || null;
+
+  // lastMessage pode não refletir normalizeType – corrigimos aqui
+  const lastType = last ? normalizeType(last) : null;
+
   return {
     id: chat.id?._serialized ?? chat.id,
     name:
@@ -82,16 +74,19 @@ function toChatDTO(chat) {
           fromMe: !!last.fromMe,
           timestamp: last.timestamp ?? null,
           ack: last.ack ?? null,
-          type: last.type,
+          type: lastType,
+          // flag para fotos tiradas da câmera (sem filename, mas type image)
+          isCameraImage:
+            lastType === "image" &&
+            last?.type === "image" &&
+            (!last?.filename || String(last?.filename).trim() === ""),
         }
       : null,
   };
 }
 
-/** Converte mensagem para DTO enriquecido com authorName (ASSÍNCRONO) */
-async function toMessageDTOAsync(tenant, msg) {
-  const authorId = msg.author ?? (msg.fromMe ? msg.to : msg.from);
-  const authorName = await resolveName(tenant, authorId);
+function toMessageDTO(msg) {
+  const type = normalizeType(msg);
 
   return {
     id: msg.id?._serialized ?? msg.id,
@@ -100,7 +95,7 @@ async function toMessageDTOAsync(tenant, msg) {
     to: msg.to,
     fromMe: !!msg.fromMe,
     body: msg.body,
-    type: msg.type, // chat, image, audio, ptt, document, etc.
+    type, // chat, image, audio, ptt(audio), document, etc. (normalizado)
     hasMedia: !!msg.hasMedia,
     mimetype: msg.mimetype ?? null,
     filename: msg.filename ?? null,
@@ -108,8 +103,11 @@ async function toMessageDTOAsync(tenant, msg) {
     ack: msg.ack ?? null, // 0 pendente, 1 enviada, 2 entregue, 3 lida, 4 reproduzida
     timestamp: msg.timestamp ?? null,
     quotedMsgId: msg.hasQuotedMsg ? msg._data?.quotedMsgId ?? null : null,
-    author: authorId ?? null,
-    authorName: authorName ?? null,
+    author: msg.author ?? null, // útil em grupos
+    isCameraImage:
+      type === "image" &&
+      msg?.type === "image" &&
+      (!msg?.filename || String(msg?.filename).trim() === ""),
   };
 }
 
@@ -121,17 +119,18 @@ function getOrCreateSession(tenant) {
     authStrategy: new LocalAuth({ clientId: tenant }),
     puppeteer: {
       headless: true,
-      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-zygote",
+      ],
     },
   });
 
-  s = {
-    client,
-    status: "OFFLINE",
-    listeners: new Set(),
-    qr: null,
-    nameCache: new Map(),
-  };
+  s = { client, status: "OFFLINE", listeners: new Set(), qr: null };
   sessions.set(tenant, s);
 
   const setStatus = (st) => {
@@ -166,14 +165,9 @@ function getOrCreateSession(tenant) {
 
   client.on("auth_failure", () => setStatus("OFFLINE"));
 
-  // --- eventos em tempo real (enriquecidos) ---
-  client.on("message", async (msg) => {
-    try {
-      const dto = await toMessageDTOAsync(tenant, msg);
-      broadcast(tenant, { type: "message", message: dto });
-    } catch {
-      // ignore
-    }
+  // --- eventos em tempo real ---
+  client.on("message", (msg) => {
+    broadcast(tenant, { type: "message", message: toMessageDTO(msg) });
   });
 
   client.on("message_ack", (msg, ack) => {
@@ -215,7 +209,9 @@ app.get("/sessions/:tenant/stream", (req, res) => {
   res.flushHeaders?.();
 
   s.listeners.add(res);
-  res.write(`data: ${JSON.stringify({ type: "status", status: s.status })}\n\n`);
+  res.write(
+    `data: ${JSON.stringify({ type: "status", status: s.status })}\n\n`
+  );
   if (s.qr) res.write(`data: ${JSON.stringify({ type: "qr", qr: s.qr })}\n\n`);
 
   req.on("close", () => s.listeners.delete(res));
@@ -241,7 +237,7 @@ app.get("/sessions", (_req, res) => {
   res.json(list);
 });
 
-// Status por tenant
+// Status simples via HTTP por tenant
 app.get("/sessions/:tenant/status", (req, res) => {
   const { tenant } = req.params;
   const s = sessions.get(tenant);
@@ -249,7 +245,7 @@ app.get("/sessions/:tenant/status", (req, res) => {
   return res.json({ ok: true, tenant, status: s.status });
 });
 
-// Health global (para monitor/Lovable)
+// ✅ Health global
 app.get("/sessions/status", (_req, res) => {
   const list = [...sessions.entries()].map(([tenant, s]) => ({
     tenant,
@@ -309,42 +305,6 @@ app.get("/sessions/:tenant/chats", async (req, res, next) => {
   }
 });
 
-// 1.1) Participantes do grupo com nomes
-// GET /sessions/:tenant/chats/:chatId/participants
-app.get("/sessions/:tenant/chats/:chatId/participants", async (req, res, next) => {
-  try {
-    const { tenant, chatId } = req.params;
-    const { client } = requireOnline(tenant);
-    const chat = await client.getChatById(chatId);
-    if (!chat?.isGroup) return res.json({ ok: true, chatId, participants: [] });
-
-    const participants = await Promise.all(
-      chat.participants.map(async (p) => {
-        const id = p?.id?._serialized ?? p?.id;
-        const name = await resolveName(tenant, id);
-        return { id, name };
-      })
-    );
-
-    res.json({ ok: true, chatId, participants });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// 1.2) Resolver nome por id
-// GET /sessions/:tenant/contacts/:id
-app.get("/sessions/:tenant/contacts/:id", async (req, res, next) => {
-  try {
-    const { tenant, id } = req.params;
-    requireOnline(tenant);
-    const name = await resolveName(tenant, id);
-    res.json({ ok: true, id, name });
-  } catch (err) {
-    next(err);
-  }
-});
-
 // 2) Foto do chat/contato
 // GET /sessions/:tenant/chats/:chatId/photo
 app.get("/sessions/:tenant/chats/:chatId/photo", async (req, res, next) => {
@@ -382,8 +342,7 @@ app.get("/sessions/:tenant/chats/:chatId/messages", async (req, res, next) => {
     const chat = await client.getChatById(chatId);
     const messages = await chat.fetchMessages({ limit });
 
-    const items = await Promise.all(messages.map((m) => toMessageDTOAsync(tenant, m)));
-    res.json(items);
+    res.json(messages.map(toMessageDTO));
   } catch (err) {
     next(err);
   }
@@ -401,13 +360,17 @@ app.get("/sessions/:tenant/messages/:messageId/media", async (req, res, next) =>
       return res.status(404).json({ ok: false, error: "Mídia não encontrada para essa mensagem" });
     }
 
-    const media = await msg.downloadMedia();
+    const media = await msg.downloadMedia(); // retorna base64
     res.json({
       ok: true,
       messageId,
       mimetype: media.mimetype,
       filename: media.filename || "file",
       data: media.data, // base64
+      // ajuda o front a identificar imagem da câmera rapidamente
+      isCameraImage:
+        (msg.type === "image" || (msg.mimetype || "").startsWith("image/")) &&
+        (!msg.filename || String(msg.filename).trim() === ""),
     });
   } catch (err) {
     next(err);
