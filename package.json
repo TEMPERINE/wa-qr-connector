@@ -2,17 +2,15 @@
   "name": "wa-qr-connector",
   "version": "1.0.0",
   "type": "module",
-  "main": "index.js",
+  "engines": { "node": ">=18" },
   "scripts": {
+    "postinstall": "npx puppeteer browsers install chrome",
     "start": "node index.js"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.19.2",
-    "node-fetch": "^3.3.2",
-    "whatsapp-web.js": "^1.21.0"
-  },
-  "engines": {
-    "node": ">=18"
+    "whatsapp-web.js": "^1.23.0",
+    "puppeteer": "^22.7.1"
   }
 }
