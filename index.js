@@ -12,7 +12,7 @@ app.use(express.json({ limit: "15mb" }));
 
 const PORT = process.env.PORT || 3000;
 
-// tenant -> { client, status, listeners:Set<res>, qr }
+// tenant -> { client, status, listeners:Set<res>, qr, nameCache: Map<string,string> }
 const sessions = new Map();
 
 /* --------------------------- helpers --------------------------- */
@@ -21,14 +21,45 @@ function broadcast(tenant, payload) {
   const s = sessions.get(tenant);
   if (!s) return;
   for (const res of s.listeners) {
-    try {
-      res.write(`data: ${JSON.stringify(payload)}\n\n`);
-    } catch {
-      // ignora listeners quebrados
-    }
+    res.write(`data: ${JSON.stringify(payload)}\n\n`);
   }
 }
 
+/** Normaliza o melhor nome possível de um contato */
+function bestName(contact, fallbackId = null) {
+  return (
+    contact?.name ||
+    contact?.pushname ||
+    contact?.verifiedName ||
+    contact?.shortName ||
+    contact?.number ||
+    fallbackId ||
+    "Contato"
+  );
+}
+
+/** Resolve e cacheia o nome por ID (ex.: 5511999999999@c.us) */
+async function resolveName(tenant, id) {
+  if (!id) return null;
+  const s = sessions.get(tenant);
+  if (!s) return null;
+
+  // cache
+  const cached = s.nameCache.get(id);
+  if (cached) return cached;
+
+  try {
+    const contact = await s.client.getContactById(id);
+    const name = bestName(contact, id);
+    s.nameCache.set(id, name);
+    return name;
+  } catch {
+    // fallback apenas ao id sem cache (pode ser que ainda não exista contato)
+    return id;
+  }
+}
+
+/** Converte um chat para DTO (sem custo alto) */
 function toChatDTO(chat) {
   const last = chat.lastMessage || null;
   return {
@@ -50,15 +81,18 @@ function toChatDTO(chat) {
           body: last.body,
           fromMe: !!last.fromMe,
           timestamp: last.timestamp ?? null,
-          ack: last.ack ?? null, // 0 pendente, 1 enviada, 2 entregue, 3 lida, 4 reproduzida
-          type: last.type, // chat, image, audio, ptt, sticker, document, etc.
-          author: last.author ?? null, // útil em grupos (id do remetente)
+          ack: last.ack ?? null,
+          type: last.type,
         }
       : null,
   };
 }
 
-function toMessageDTO(msg) {
+/** Converte mensagem para DTO enriquecido com authorName (ASSÍNCRONO) */
+async function toMessageDTOAsync(tenant, msg) {
+  const authorId = msg.author ?? (msg.fromMe ? msg.to : msg.from);
+  const authorName = await resolveName(tenant, authorId);
+
   return {
     id: msg.id?._serialized ?? msg.id,
     chatId: msg.fromMe ? msg.to : msg.from,
@@ -66,17 +100,16 @@ function toMessageDTO(msg) {
     to: msg.to,
     fromMe: !!msg.fromMe,
     body: msg.body,
-    type: msg.type, // chat, image, audio, ptt, sticker, document, etc.
+    type: msg.type, // chat, image, audio, ptt, document, etc.
     hasMedia: !!msg.hasMedia,
     mimetype: msg.mimetype ?? null,
     filename: msg.filename ?? null,
     size: msg.size ?? null,
-    duration: msg.duration ?? null, // para áudios/vídeos quando disponível
     ack: msg.ack ?? null, // 0 pendente, 1 enviada, 2 entregue, 3 lida, 4 reproduzida
     timestamp: msg.timestamp ?? null,
     quotedMsgId: msg.hasQuotedMsg ? msg._data?.quotedMsgId ?? null : null,
-    author: msg.author ?? null, // útil em grupos
-    mentionedIds: Array.isArray(msg.mentionedIds) ? msg.mentionedIds : [],
+    author: authorId ?? null,
+    authorName: authorName ?? null,
   };
 }
 
@@ -92,7 +125,13 @@ function getOrCreateSession(tenant) {
     },
   });
 
-  s = { client, status: "OFFLINE", listeners: new Set(), qr: null };
+  s = {
+    client,
+    status: "OFFLINE",
+    listeners: new Set(),
+    qr: null,
+    nameCache: new Map(),
+  };
   sessions.set(tenant, s);
 
   const setStatus = (st) => {
@@ -116,21 +155,25 @@ function getOrCreateSession(tenant) {
     broadcast(tenant, { type: "state", state })
   );
 
-  client.on("disconnected", () => {
+  client.on("disconnected", async () => {
     setStatus("RECONNECTING");
-    // tenta reinicializar com um pequeno atraso para evitar loops agressivos
-    setTimeout(() => {
-      client
-        .initialize()
-        .catch(() => setStatus("OFFLINE"));
-    }, 2000);
+    try {
+      await client.initialize();
+    } catch {
+      setStatus("OFFLINE");
+    }
   });
 
   client.on("auth_failure", () => setStatus("OFFLINE"));
 
-  // --- eventos em tempo real ---
-  client.on("message", (msg) => {
-    broadcast(tenant, { type: "message", message: toMessageDTO(msg) });
+  // --- eventos em tempo real (enriquecidos) ---
+  client.on("message", async (msg) => {
+    try {
+      const dto = await toMessageDTOAsync(tenant, msg);
+      broadcast(tenant, { type: "message", message: dto });
+    } catch {
+      // ignore
+    }
   });
 
   client.on("message_ack", (msg, ack) => {
@@ -172,7 +215,6 @@ app.get("/sessions/:tenant/stream", (req, res) => {
   res.flushHeaders?.();
 
   s.listeners.add(res);
-  // snapshot inicial
   res.write(`data: ${JSON.stringify({ type: "status", status: s.status })}\n\n`);
   if (s.qr) res.write(`data: ${JSON.stringify({ type: "qr", qr: s.qr })}\n\n`);
 
@@ -199,7 +241,7 @@ app.get("/sessions", (_req, res) => {
   res.json(list);
 });
 
-// Status simples por tenant
+// Status por tenant
 app.get("/sessions/:tenant/status", (req, res) => {
   const { tenant } = req.params;
   const s = sessions.get(tenant);
@@ -207,7 +249,7 @@ app.get("/sessions/:tenant/status", (req, res) => {
   return res.json({ ok: true, tenant, status: s.status });
 });
 
-// ✅ Status GLOBAL (health-check)
+// Health global (para monitor/Lovable)
 app.get("/sessions/status", (_req, res) => {
   const list = [...sessions.entries()].map(([tenant, s]) => ({
     tenant,
@@ -242,7 +284,7 @@ app.get("/sessions/:tenant/chats", async (req, res, next) => {
     const chats = await client.getChats();
 
     let items = chats
-      .filter((c) => !c.isAnnouncement) // evita canais
+      .filter((c) => !c.isAnnouncement)
       .map(toChatDTO);
 
     if (isGroup !== null) items = items.filter((c) => c.isGroup === isGroup);
@@ -258,11 +300,46 @@ app.get("/sessions/:tenant/chats", async (req, res, next) => {
       );
     }
 
-    // ordena por atividade recente
     items.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
 
     const slice = items.slice(offset, offset + limit);
     res.json({ total: items.length, offset, limit, items: slice });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 1.1) Participantes do grupo com nomes
+// GET /sessions/:tenant/chats/:chatId/participants
+app.get("/sessions/:tenant/chats/:chatId/participants", async (req, res, next) => {
+  try {
+    const { tenant, chatId } = req.params;
+    const { client } = requireOnline(tenant);
+    const chat = await client.getChatById(chatId);
+    if (!chat?.isGroup) return res.json({ ok: true, chatId, participants: [] });
+
+    const participants = await Promise.all(
+      chat.participants.map(async (p) => {
+        const id = p?.id?._serialized ?? p?.id;
+        const name = await resolveName(tenant, id);
+        return { id, name };
+      })
+    );
+
+    res.json({ ok: true, chatId, participants });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// 1.2) Resolver nome por id
+// GET /sessions/:tenant/contacts/:id
+app.get("/sessions/:tenant/contacts/:id", async (req, res, next) => {
+  try {
+    const { tenant, id } = req.params;
+    requireOnline(tenant);
+    const name = await resolveName(tenant, id);
+    res.json({ ok: true, id, name });
   } catch (err) {
     next(err);
   }
@@ -278,7 +355,6 @@ app.get("/sessions/:tenant/chats/:chatId/photo", async (req, res, next) => {
     const chat = await client.getChatById(chatId);
     let url = null;
 
-    // alguns tipos expõem getProfilePicUrl no chat; em outros, via contact
     if (typeof chat.getProfilePicUrl === "function") {
       url = await chat.getProfilePicUrl();
     }
@@ -289,7 +365,7 @@ app.get("/sessions/:tenant/chats/:chatId/photo", async (req, res, next) => {
       }
     }
 
-    res.json({ ok: true, chatId, url }); // se null, não há foto definida
+    res.json({ ok: true, chatId, url });
   } catch (err) {
     next(err);
   }
@@ -306,7 +382,8 @@ app.get("/sessions/:tenant/chats/:chatId/messages", async (req, res, next) => {
     const chat = await client.getChatById(chatId);
     const messages = await chat.fetchMessages({ limit });
 
-    res.json(messages.map(toMessageDTO));
+    const items = await Promise.all(messages.map((m) => toMessageDTOAsync(tenant, m)));
+    res.json(items);
   } catch (err) {
     next(err);
   }
@@ -324,8 +401,7 @@ app.get("/sessions/:tenant/messages/:messageId/media", async (req, res, next) =>
       return res.status(404).json({ ok: false, error: "Mídia não encontrada para essa mensagem" });
     }
 
-    const media = await msg.downloadMedia(); // MessageMedia
-    // retorna JSON com base64; se preferir, retorne como arquivo binário
+    const media = await msg.downloadMedia();
     res.json({
       ok: true,
       messageId,
@@ -338,37 +414,18 @@ app.get("/sessions/:tenant/messages/:messageId/media", async (req, res, next) =>
   }
 });
 
-// 5) Enviar texto (suporta quoted e mentions)
-// POST /sessions/:tenant/messages  { to, body, quotedMsgId?, mentions?: [contactId] }
+// 5) Enviar texto
+// POST /sessions/:tenant/messages  { to, body, quotedMsgId? }
 app.post("/sessions/:tenant/messages", async (req, res, next) => {
   try {
     const { tenant } = req.params;
-    let { to, body, quotedMsgId, mentions } = req.body || {};
+    let { to, body, quotedMsgId } = req.body || {};
     if (!to || !body) return res.status(400).json({ ok: false, error: "to e body são obrigatórios" });
 
     if (!to.includes("@")) to = `${to}@c.us`;
 
     const { client } = requireOnline(tenant);
-
-    let mentionContacts = [];
-    if (Array.isArray(mentions) && mentions.length) {
-      // map ids -> Contact
-      mentionContacts = await Promise.all(
-        mentions.map(async (id) => {
-          try {
-            return await client.getContactById(id);
-          } catch {
-            return null;
-          }
-        })
-      );
-      mentionContacts = mentionContacts.filter(Boolean);
-    }
-
-    const options = {};
-    if (quotedMsgId) options.quotedMessageId = quotedMsgId;
-    if (mentionContacts.length) options.mentions = mentionContacts;
-
+    const options = quotedMsgId ? { quotedMessageId: quotedMsgId } : {};
     const msg = await client.sendMessage(to, body, options);
     res.json({ ok: true, messageId: msg.id?._serialized ?? msg.id });
   } catch (err) {
@@ -378,7 +435,6 @@ app.post("/sessions/:tenant/messages", async (req, res, next) => {
 
 // 6) Enviar mídia (URL ou base64)
 // POST /sessions/:tenant/messages/media
-// body: { to, mediaUrl, caption?, filename?, mimetype? }  OU  { to, base64, mimetype, filename, caption? }
 app.post("/sessions/:tenant/messages/media", async (req, res, next) => {
   try {
     const { tenant } = req.params;
@@ -420,74 +476,6 @@ app.post("/sessions/:tenant/chats/:chatId/read", async (req, res, next) => {
     const chat = await client.getChatById(chatId);
     await chat.sendSeen();
     res.json({ ok: true });
-  } catch (err) {
-    next(err);
-  }
-});
-
-/* ----------- utilitários para nomes/menções/participantes ----------- */
-
-// (A) Resolver nomes de uma lista de ids (contatos ou participantes)
-// GET /sessions/:tenant/contacts/resolve?ids=a@c.us,b@c.us
-app.get("/sessions/:tenant/contacts/resolve", async (req, res, next) => {
-  try {
-    const { tenant } = req.params;
-    const ids = String(req.query.ids || "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (!ids.length) return res.json({ ok: true, contacts: {} });
-
-    const { client } = requireOnline(tenant);
-    const entries = await Promise.all(
-      ids.map(async (id) => {
-        try {
-          const c = await client.getContactById(id);
-          const name =
-            c.name || c.pushname || c.shortName || c.verifiedName || c.number || id;
-          return [id, { id, name, number: c.number ?? null }];
-        } catch {
-          return [id, { id, name: id, number: null }];
-        }
-      })
-    );
-    res.json({ ok: true, contacts: Object.fromEntries(entries) });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// (B) Participantes do grupo (com nomes)
-// GET /sessions/:tenant/groups/:chatId/participants
-app.get("/sessions/:tenant/groups/:chatId/participants", async (req, res, next) => {
-  try {
-    const { tenant, chatId } = req.params;
-    const { client } = requireOnline(tenant);
-    const chat = await client.getChatById(chatId);
-    if (!chat.isGroup) return res.status(400).json({ ok: false, error: "Chat não é grupo" });
-
-    const participants = await Promise.all(
-      chat.participants.map(async (p) => {
-        try {
-          const c = await client.getContactById(p.id._serialized);
-          const name = c.name || c.pushname || c.shortName || c.verifiedName || c.number || p.id.user;
-          return {
-            id: p.id._serialized,
-            admin: p.isAdmin || p.isSuperAdmin || false,
-            name,
-            number: c.number ?? p.id.user,
-          };
-        } catch {
-          return {
-            id: p.id._serialized,
-            admin: p.isAdmin || p.isSuperAdmin || false,
-            name: p.id.user,
-            number: p.id.user,
-          };
-        }
-      })
-    );
-    res.json({ ok: true, chatId, participants });
   } catch (err) {
     next(err);
   }
