@@ -1,5 +1,5 @@
 // index.js
-// ===== WhatsApp QR Connector - Atendimento (multi-tenant) =====
+// ===== WhatsApp QR Connector - Multi-tenant =====
 
 import express from "express";
 import cors from "cors";
@@ -15,18 +15,16 @@ const PORT = process.env.PORT || 3000;
 // tenant -> { client, status, listeners:Set<res>, qr }
 const sessions = new Map();
 
-/* --------------------------- helpers --------------------------- */
+/* --------------------------- utils --------------------------- */
 
-function broadcast(tenant, payload) {
-  const s = sessions.get(tenant);
-  if (!s) return;
-  for (const res of s.listeners) {
-    res.write(`data: ${JSON.stringify(payload)}\n\n`);
-  }
-}
+const shortName = (s) => {
+  if (!s) return "";
+  const parts = s.trim().split(/\s+/);
+  if (parts.length === 1) return parts[0];
+  return `${parts[0]} ${parts[parts.length - 1]}`; // “Nome Sobrenome”
+};
 
 function normalizeType(msg) {
-  // Unifica detecção de mídia (inclui foto tirada pela Câmera)
   try {
     const t = msg?.type || "";
     const mt = msg?.mimetype || "";
@@ -37,7 +35,6 @@ function normalizeType(msg) {
 
     if (t === "ptt") return "audio";
     if (t === "audio") return "audio";
-
     if (has && mt.startsWith("audio/")) return "audio";
     if (has && mt.startsWith("video/")) return "video";
     if (has && (mt === "image/webp" || mt === "application/webp")) return "sticker";
@@ -48,11 +45,71 @@ function normalizeType(msg) {
   }
 }
 
-function toChatDTO(chat) {
-  const last = chat.lastMessage || null;
+async function resolveContactName(client, contactId) {
+  try {
+    const c = await client.getContactById(contactId);
+    const name = c?.name || c?.pushname || c?.shortName || c?.number || contactId;
+    return { name, short: shortName(name) };
+  } catch {
+    const num = (contactId || "").replace(/@.+$/, "");
+    return { name: num, short: num };
+  }
+}
 
-  // lastMessage pode não refletir normalizeType – corrigimos aqui
-  const lastType = last ? normalizeType(last) : null;
+async function resolveMessageSenderName(client, msg) {
+  // Em grupos, msg.author contém o ID do remetente (formato 55...@c.us)
+  const senderId = msg?.author || msg?.from || null;
+  if (!senderId) return { name: null, short: null };
+  return await resolveContactName(client, senderId);
+}
+
+function broadcast(tenant, payload) {
+  const s = sessions.get(tenant);
+  if (!s) return;
+  for (const res of s.listeners) res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+
+/* --------------------------- DTOs --------------------------- */
+
+async function toMessageDTO(msg, client) {
+  const type = normalizeType(msg);
+  const { name: senderName, short: senderShort } = await resolveMessageSenderName(client, msg);
+
+  return {
+    id: msg.id?._serialized ?? msg.id,
+    chatId: msg.fromMe ? msg.to : msg.from,
+    from: msg.from,
+    to: msg.to,
+    fromMe: !!msg.fromMe,
+    body: msg.body,
+    type, // chat, image, audio, video, sticker, document...
+    hasMedia: !!msg.hasMedia,
+    mimetype: msg.mimetype ?? null,
+    filename: msg.filename ?? null,
+    size: msg.size ?? null,
+    ack: msg.ack ?? null, // 0 pendente, 1 enviada, 2 entregue, 3 lida, 4 reproduzida
+    timestamp: msg.timestamp ?? null,
+    quotedMsgId: msg.hasQuotedMsg ? msg._data?.quotedMsgId ?? null : null,
+    author: msg.author ?? null, // útil em grupos
+    senderName,
+    senderShort,
+    isCameraImage:
+      type === "image" &&
+      msg?.type === "image" &&
+      (!msg?.filename || String(msg?.filename).trim() === ""),
+  };
+}
+
+async function toChatDTO(chat, client) {
+  const last = chat.lastMessage || null;
+  const type = last ? normalizeType(last) : null;
+
+  // Se for grupo, resolvemos o remetente da última mensagem para exibir no preview
+  let lastSenderName = null;
+  if (last && chat.isGroup) {
+    const r = await resolveMessageSenderName(client, last);
+    lastSenderName = r.name;
+  }
 
   return {
     id: chat.id?._serialized ?? chat.id,
@@ -74,10 +131,10 @@ function toChatDTO(chat) {
           fromMe: !!last.fromMe,
           timestamp: last.timestamp ?? null,
           ack: last.ack ?? null,
-          type: lastType,
-          // flag para fotos tiradas da câmera (sem filename, mas type image)
+          type,
+          senderName: lastSenderName, // <<<<<< importante para preview de grupo
           isCameraImage:
-            lastType === "image" &&
+            type === "image" &&
             last?.type === "image" &&
             (!last?.filename || String(last?.filename).trim() === ""),
         }
@@ -85,31 +142,7 @@ function toChatDTO(chat) {
   };
 }
 
-function toMessageDTO(msg) {
-  const type = normalizeType(msg);
-
-  return {
-    id: msg.id?._serialized ?? msg.id,
-    chatId: msg.fromMe ? msg.to : msg.from,
-    from: msg.from,
-    to: msg.to,
-    fromMe: !!msg.fromMe,
-    body: msg.body,
-    type, // chat, image, audio, ptt(audio), document, etc. (normalizado)
-    hasMedia: !!msg.hasMedia,
-    mimetype: msg.mimetype ?? null,
-    filename: msg.filename ?? null,
-    size: msg.size ?? null,
-    ack: msg.ack ?? null, // 0 pendente, 1 enviada, 2 entregue, 3 lida, 4 reproduzida
-    timestamp: msg.timestamp ?? null,
-    quotedMsgId: msg.hasQuotedMsg ? msg._data?.quotedMsgId ?? null : null,
-    author: msg.author ?? null, // útil em grupos
-    isCameraImage:
-      type === "image" &&
-      msg?.type === "image" &&
-      (!msg?.filename || String(msg?.filename).trim() === ""),
-  };
-}
+/* --------------------------- sessão --------------------------- */
 
 function getOrCreateSession(tenant) {
   let s = sessions.get(tenant);
@@ -138,7 +171,6 @@ function getOrCreateSession(tenant) {
     broadcast(tenant, { type: "status", status: st });
   };
 
-  // --- conexão / QR ---
   client.on("qr", (qr) => {
     s.qr = qr;
     setStatus("RECONNECTING");
@@ -150,24 +182,18 @@ function getOrCreateSession(tenant) {
     broadcast(tenant, { type: "ready", ok: true });
   });
 
-  client.on("change_state", (state) =>
-    broadcast(tenant, { type: "state", state })
-  );
+  client.on("change_state", (state) => broadcast(tenant, { type: "state", state }));
 
   client.on("disconnected", async () => {
     setStatus("RECONNECTING");
-    try {
-      await client.initialize();
-    } catch {
-      setStatus("OFFLINE");
-    }
+    try { await client.initialize(); } catch { setStatus("OFFLINE"); }
   });
 
   client.on("auth_failure", () => setStatus("OFFLINE"));
 
-  // --- eventos em tempo real ---
-  client.on("message", (msg) => {
-    broadcast(tenant, { type: "message", message: toMessageDTO(msg) });
+  client.on("message", async (msg) => {
+    const dto = await toMessageDTO(msg, client);
+    broadcast(tenant, { type: "message", message: dto });
   });
 
   client.on("message_ack", (msg, ack) => {
@@ -189,7 +215,7 @@ function requireOnline(tenant) {
   return s;
 }
 
-/* --------------------------- rotas conexão --------------------------- */
+/* --------------------------- rotas de sessão --------------------------- */
 
 app.post("/sessions/:tenant/start", (req, res) => {
   const { tenant } = req.params;
@@ -209,11 +235,8 @@ app.get("/sessions/:tenant/stream", (req, res) => {
   res.flushHeaders?.();
 
   s.listeners.add(res);
-  res.write(
-    `data: ${JSON.stringify({ type: "status", status: s.status })}\n\n`
-  );
+  res.write(`data: ${JSON.stringify({ type: "status", status: s.status })}\n\n`);
   if (s.qr) res.write(`data: ${JSON.stringify({ type: "qr", qr: s.qr })}\n\n`);
-
   req.on("close", () => s.listeners.delete(res));
 });
 
@@ -221,23 +244,17 @@ app.post("/sessions/:tenant/stop", async (req, res) => {
   const { tenant } = req.params;
   const s = sessions.get(tenant);
   if (s) {
-    try {
-      await s.client.destroy();
-    } catch {}
+    try { await s.client.destroy(); } catch {}
     sessions.delete(tenant);
   }
   return res.json({ ok: true, tenant });
 });
 
 app.get("/sessions", (_req, res) => {
-  const list = [...sessions.entries()].map(([tenant, s]) => ({
-    tenant,
-    status: s.status,
-  }));
+  const list = [...sessions.entries()].map(([tenant, s]) => ({ tenant, status: s.status }));
   res.json(list);
 });
 
-// Status simples via HTTP por tenant
 app.get("/sessions/:tenant/status", (req, res) => {
   const { tenant } = req.params;
   const s = sessions.get(tenant);
@@ -245,31 +262,20 @@ app.get("/sessions/:tenant/status", (req, res) => {
   return res.json({ ok: true, tenant, status: s.status });
 });
 
-// ✅ Health global
 app.get("/sessions/status", (_req, res) => {
-  const list = [...sessions.entries()].map(([tenant, s]) => ({
-    tenant,
-    status: s.status,
-  }));
-  res.json({
-    ok: true,
-    status: "online",
-    uptime: process.uptime(),
-    sessions: list,
-  });
+  const list = [...sessions.entries()].map(([tenant, s]) => ({ tenant, status: s.status }));
+  res.json({ ok: true, status: "online", uptime: process.uptime(), sessions: list });
 });
 
-/* --------------------------- rotas atendimento --------------------------- */
+/* --------------------------- rotas de atendimento --------------------------- */
 
-// 1) Listar chats com filtros/paginação
-// GET /sessions/:tenant/chats?q=&isGroup=true|false&archived=true|false&unreadOnly=true|false&limit=30&offset=0
+// Listar chats (com preview já normalizado + lastSenderName em grupos)
 app.get("/sessions/:tenant/chats", async (req, res, next) => {
   try {
     const { tenant } = req.params;
     const q = (req.query.q || "").toString().toLowerCase();
     const limit = Math.max(1, Math.min(Number(req.query.limit) || 30, 200));
     const offset = Math.max(0, Number(req.query.offset) || 0);
-
     const isGroup =
       req.query.isGroup === "true" ? true : req.query.isGroup === "false" ? false : null;
     const archived =
@@ -279,9 +285,11 @@ app.get("/sessions/:tenant/chats", async (req, res, next) => {
     const { client } = requireOnline(tenant);
     const chats = await client.getChats();
 
-    let items = chats
-      .filter((c) => !c.isAnnouncement)
-      .map(toChatDTO);
+    let items = [];
+    for (const c of chats) {
+      if (c.isAnnouncement) continue;
+      items.push(await toChatDTO(c, client));
+    }
 
     if (isGroup !== null) items = items.filter((c) => c.isGroup === isGroup);
     if (archived !== null) items = items.filter((c) => c.archived === archived);
@@ -297,7 +305,6 @@ app.get("/sessions/:tenant/chats", async (req, res, next) => {
     }
 
     items.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
-
     const slice = items.slice(offset, offset + limit);
     res.json({ total: items.length, offset, limit, items: slice });
   } catch (err) {
@@ -305,69 +312,99 @@ app.get("/sessions/:tenant/chats", async (req, res, next) => {
   }
 });
 
-// 2) Foto do chat/contato
-// GET /sessions/:tenant/chats/:chatId/photo
+// Participantes de um grupo (para cache no front)
+app.get("/sessions/:tenant/chats/:chatId/participants", async (req, res, next) => {
+  try {
+    const { tenant, chatId } = req.params;
+    const { client } = requireOnline(tenant);
+    const chat = await client.getChatById(chatId);
+    if (!chat.isGroup) return res.json({ ok: true, participants: [] });
+
+    const result = [];
+    for (const p of chat.participants || []) {
+      const id = p?.id?._serialized ?? p?.id;
+      const { name, short } = await resolveContactName(client, id);
+      result.push({ id, name, short, isAdmin: !!p.isAdmin || !!p.isSuperAdmin });
+    }
+    res.json({ ok: true, participants: result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Resolver contatos em lote: /contacts?ids=id1,id2,id3
+app.get("/sessions/:tenant/contacts", async (req, res, next) => {
+  try {
+    const { tenant } = req.params;
+    const ids = String(req.query.ids || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const { client } = requireOnline(tenant);
+
+    const out = {};
+    for (const id of ids) {
+      out[id] = await resolveContactName(client, id);
+    }
+    res.json({ ok: true, contacts: out });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Foto do chat/contato
 app.get("/sessions/:tenant/chats/:chatId/photo", async (req, res, next) => {
   try {
     const { tenant, chatId } = req.params;
     const { client } = requireOnline(tenant);
-
     const chat = await client.getChatById(chatId);
     let url = null;
-
-    if (typeof chat.getProfilePicUrl === "function") {
-      url = await chat.getProfilePicUrl();
-    }
+    if (typeof chat.getProfilePicUrl === "function") url = await chat.getProfilePicUrl();
     if (!url && typeof chat.getContact === "function") {
       const contact = await chat.getContact();
       if (contact && typeof contact.getProfilePicUrl === "function") {
         url = await contact.getProfilePicUrl();
       }
     }
-
     res.json({ ok: true, chatId, url });
   } catch (err) {
     next(err);
   }
 });
 
-// 3) Listar mensagens de um chat (histórico)
-// GET /sessions/:tenant/chats/:chatId/messages?limit=50
+// Histórico
 app.get("/sessions/:tenant/chats/:chatId/messages", async (req, res, next) => {
   try {
     const { tenant, chatId } = req.params;
     const limit = Math.max(1, Math.min(Number(req.query.limit) || 50, 200));
-
     const { client } = requireOnline(tenant);
     const chat = await client.getChatById(chatId);
     const messages = await chat.fetchMessages({ limit });
 
-    res.json(messages.map(toMessageDTO));
+    const list = [];
+    for (const m of messages) list.push(await toMessageDTO(m, client));
+    res.json(list);
   } catch (err) {
     next(err);
   }
 });
 
-// 4) Baixar mídia de uma mensagem
-// GET /sessions/:tenant/messages/:messageId/media
+// Mídia de mensagem
 app.get("/sessions/:tenant/messages/:messageId/media", async (req, res, next) => {
   try {
     const { tenant, messageId } = req.params;
     const { client } = requireOnline(tenant);
-
     const msg = await client.getMessageById(messageId);
     if (!msg || !msg.hasMedia) {
       return res.status(404).json({ ok: false, error: "Mídia não encontrada para essa mensagem" });
     }
-
-    const media = await msg.downloadMedia(); // retorna base64
+    const media = await msg.downloadMedia();
     res.json({
       ok: true,
       messageId,
       mimetype: media.mimetype,
       filename: media.filename || "file",
       data: media.data, // base64
-      // ajuda o front a identificar imagem da câmera rapidamente
       isCameraImage:
         (msg.type === "image" || (msg.mimetype || "").startsWith("image/")) &&
         (!msg.filename || String(msg.filename).trim() === ""),
@@ -377,14 +414,12 @@ app.get("/sessions/:tenant/messages/:messageId/media", async (req, res, next) =>
   }
 });
 
-// 5) Enviar texto
-// POST /sessions/:tenant/messages  { to, body, quotedMsgId? }
+// Enviar texto
 app.post("/sessions/:tenant/messages", async (req, res, next) => {
   try {
     const { tenant } = req.params;
     let { to, body, quotedMsgId } = req.body || {};
     if (!to || !body) return res.status(400).json({ ok: false, error: "to e body são obrigatórios" });
-
     if (!to.includes("@")) to = `${to}@c.us`;
 
     const { client } = requireOnline(tenant);
@@ -396,15 +431,13 @@ app.post("/sessions/:tenant/messages", async (req, res, next) => {
   }
 });
 
-// 6) Enviar mídia (URL ou base64)
-// POST /sessions/:tenant/messages/media
+// Enviar mídia (url ou base64)
 app.post("/sessions/:tenant/messages/media", async (req, res, next) => {
   try {
     const { tenant } = req.params;
     let { to, mediaUrl, base64, caption, filename, mimetype } = req.body || {};
     if (!to) return res.status(400).json({ ok: false, error: "to é obrigatório" });
     if (!mediaUrl && !base64) return res.status(400).json({ ok: false, error: "informe mediaUrl ou base64" });
-
     if (!to.includes("@")) to = `${to}@c.us`;
 
     let media;
@@ -430,8 +463,7 @@ app.post("/sessions/:tenant/messages/media", async (req, res, next) => {
   }
 });
 
-// 7) Marcar chat como lido
-// POST /sessions/:tenant/chats/:chatId/read
+// Marcar lido
 app.post("/sessions/:tenant/chats/:chatId/read", async (req, res, next) => {
   try {
     const { tenant, chatId } = req.params;
